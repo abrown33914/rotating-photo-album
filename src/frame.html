@@ -46,6 +46,8 @@
   #info.show { opacity: 1; visibility: visible; }
   #info .name { font-weight: 600; word-break: break-all; margin-bottom: 4px; }
   #info .meta { color: #bbb; font-size: 15px; }
+  #info .note { color: #fff; font-size: 15px; margin-top: 6px; }
+  #info .note:empty { display: none; }
   #info .buttons { margin-top: 12px; }
   #info button {
     -webkit-appearance: none; appearance: none;
@@ -64,9 +66,12 @@
 <div id="info">
   <div class="name" id="info-name"></div>
   <div class="meta" id="info-meta"></div>
+  <div class="note" id="info-note"></div>
   <div class="buttons">
     <button id="btn-next" type="button">Next photo</button>
+    <button id="btn-hide" type="button">Hide photo</button>
     <button id="btn-sync" type="button">Sync now</button>
+    <button id="btn-undo" type="button" style="display:none">Undo</button>
   </div>
 </div>
 
@@ -93,6 +98,8 @@
   var currentId = null;
   var lastSync = null;
   var dupCount = 0;
+  var hiddenCount = 0;
+  var lastHidden = null;  // for Undo
   var failStreak = 0;
   var timer = null;
   var infoTimer = null;
@@ -163,6 +170,7 @@
       var previous = photos;
       photos = next;
       dupCount = data.duplicates || 0;
+      hiddenCount = data.hidden || 0;
       lastSync = new Date();
 
       // Keep the upcoming queue, drop deleted photos, slot new ones in at random spots.
@@ -258,6 +266,7 @@
     var count = keys(photos).length;
     var text = count + (count === 1 ? ' photo' : ' photos');
     if (dupCount) text += ', ' + dupCount + (dupCount === 1 ? ' duplicate' : ' duplicates') + ' skipped';
+    if (hiddenCount) text += ', ' + hiddenCount + ' hidden';
     text += '. Synced ' + minutesAgo(lastSync) + '.';
     document.getElementById('info-meta').textContent = text;
   }
@@ -268,11 +277,63 @@
     if (show) {
       updateInfo();
       infoEl.className = 'show';
-      infoTimer = setTimeout(function () { infoEl.className = ''; }, 8000);
+      infoTimer = setTimeout(closeInfo, 8000);
     } else {
-      infoEl.className = '';
+      closeInfo();
     }
   }
+
+  function closeInfo() {
+    infoEl.className = '';
+    setNote('');
+    document.getElementById('btn-undo').style.display = 'none';
+  }
+
+  function setNote(text) {
+    document.getElementById('info-note').textContent = text;
+  }
+
+  function post(path, done) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', path, true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) done(xhr.status === 200);
+    };
+    xhr.send();
+  }
+
+  document.getElementById('btn-hide').addEventListener('click', function (e) {
+    e.stopPropagation();
+    var id = currentId;
+    var p = id && photos[id];
+    if (!p) return;
+
+    post('api/hide/' + encodeURIComponent(id), function (ok) {
+      if (!ok) { setNote('Couldn\u2019t hide that photo. Try again.'); toggleInfo(true); return; }
+      lastHidden = p;
+      delete photos[id];
+      hiddenCount++;
+      showNext();
+      toggleInfo(true);
+      setNote('Hidden: ' + p.name);
+      document.getElementById('btn-undo').style.display = 'inline-block';
+    });
+  });
+
+  document.getElementById('btn-undo').addEventListener('click', function (e) {
+    e.stopPropagation();
+    var p = lastHidden;
+    if (!p) return;
+
+    post('api/unhide/' + encodeURIComponent(p.id), function (ok) {
+      if (!ok) { setNote('Couldn\u2019t undo. Try again.'); toggleInfo(true); return; }
+      lastHidden = null;
+      document.getElementById('btn-undo').style.display = 'none';
+      toggleInfo(true);
+      setNote('Restored: ' + p.name);
+      sync();
+    });
+  });
 
   document.getElementById('stage').addEventListener('click', function () { toggleInfo(); });
   document.getElementById('btn-next').addEventListener('click', function (e) {

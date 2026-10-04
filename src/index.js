@@ -6,7 +6,8 @@ const LIST_TTL_MS = 60 * 1000; // re-check the folder at most once a minute
 
 // Kept in memory between requests while the Worker stays warm.
 let tokenCache = { value: null, expires: 0 };
-let listCache = { photos: null, byId: null, duplicates: 0, expires: 0 };
+let listCache = { photos: null, byId: null, duplicates: 0, hidden: 0, expires: 0 };
+let hiddenCache = { value: null, expires: 0 };
 
 export default {
   async fetch(request, env) {
@@ -25,6 +26,10 @@ export default {
     try {
       if (rest.length === 0) return page();
       if (rest[0] === "api" && rest[1] === "photos") return await photosJson(env);
+      if (rest[0] === "api" && (rest[1] === "hide" || rest[1] === "unhide") && rest[2]) {
+        if (request.method !== "POST") return new Response("Use POST", { status: 405 });
+        return await setHidden(decodeURIComponent(rest[2]), rest[1] === "hide", env);
+      }
       if (rest[0] === "photo" && rest[1]) return await photo(rest[1], url, env);
     } catch (err) {
       return json({ error: err.message }, 502);
@@ -47,8 +52,39 @@ function page() {
 }
 
 async function photosJson(env) {
-  const { photos, duplicates } = await listPhotos(env);
-  return json({ photos: photos.map((p) => ({ id: p.id, name: p.name })), duplicates });
+  const { photos, duplicates, hidden } = await listPhotos(env);
+  return json({ photos: photos.map((p) => ({ id: p.id, name: p.name })), duplicates, hidden });
+}
+
+async function setHidden(id, hide, env) {
+  if (!env.HIDDEN) throw new Error("Hidden-photo storage isn't set up (HIDDEN KV binding missing).");
+  const hidden = { ...(await getHidden(env)) };
+
+  if (hide) {
+    const { byId } = await listPhotos(env);
+    const file = byId.get(id);
+    hidden[id] = {
+      name: file ? file.name : "",
+      md5: (file && file.md5Checksum) || "",
+      at: new Date().toISOString(),
+    };
+  } else {
+    delete hidden[id];
+  }
+
+  await env.HIDDEN.put("hidden", JSON.stringify(hidden));
+  hiddenCache = { value: hidden, expires: Date.now() + 60 * 1000 };
+  listCache.expires = 0; // rebuild the list on the next request
+  return json({ ok: true });
+}
+
+// The hidden list is one small JSON object in KV: { fileId: { name, md5, at } }.
+async function getHidden(env) {
+  if (!env.HIDDEN) return {};
+  if (hiddenCache.value && Date.now() < hiddenCache.expires) return hiddenCache.value;
+  const value = (await env.HIDDEN.get("hidden", "json")) || {};
+  hiddenCache = { value, expires: Date.now() + 60 * 1000 };
+  return value;
 }
 
 async function photo(id, url, env) {
@@ -111,10 +147,19 @@ async function listPhotos(env) {
   // Sort by name so the same copy of a duplicate is always the one kept.
   files.sort((a, b) => a.name.localeCompare(b.name));
 
+  const hiddenList = await getHidden(env);
+  const hiddenMd5 = new Set(Object.values(hiddenList).map((h) => h.md5).filter(Boolean));
+
   const seen = new Set();
   const photos = [];
   let duplicates = 0;
+  let hidden = 0;
   for (const f of files) {
+    // Hidden photos stay out, along with any exact copies of them.
+    if (hiddenList[f.id] || (f.md5Checksum && hiddenMd5.has(f.md5Checksum))) {
+      hidden++;
+      continue;
+    }
     if (f.md5Checksum) {
       if (seen.has(f.md5Checksum)) {
         duplicates++;
@@ -129,6 +174,7 @@ async function listPhotos(env) {
     photos,
     byId: new Map(photos.map((p) => [p.id, p])),
     duplicates,
+    hidden,
     expires: Date.now() + LIST_TTL_MS,
   };
   return listCache;
