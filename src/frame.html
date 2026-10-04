@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Photos">
+<meta name="robots" content="noindex">
+<title>Family Photos</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: rgba(0,0,0,0);
+    -webkit-touch-callout: none;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  #stage { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: pointer; }
+  .slide {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background-color: #000;
+    background-position: center center;
+    background-repeat: no-repeat;
+    -webkit-background-size: contain; background-size: contain;
+    opacity: 0;
+    -webkit-transition: opacity 1.5s ease-in-out; transition: opacity 1.5s ease-in-out;
+  }
+  .slide.on { opacity: 1; }
+
+  #message {
+    position: absolute; left: 10%; right: 10%; top: 40%;
+    text-align: center; color: #ddd; font-size: 20px; line-height: 1.5;
+  }
+
+  #info {
+    position: absolute; left: 20px; bottom: 20px; max-width: 70%;
+    padding: 16px 20px; border-radius: 14px;
+    background: rgba(0,0,0,0.72); color: #fff;
+    font-size: 17px; line-height: 1.45;
+    opacity: 0; visibility: hidden;
+    -webkit-transition: opacity .25s, visibility .25s; transition: opacity .25s, visibility .25s;
+  }
+  #info.show { opacity: 1; visibility: visible; }
+  #info .name { font-weight: 600; word-break: break-all; margin-bottom: 4px; }
+  #info .meta { color: #bbb; font-size: 15px; }
+  #info .buttons { margin-top: 12px; }
+  #info button {
+    -webkit-appearance: none; appearance: none;
+    font: inherit; font-size: 16px; color: #fff;
+    background: rgba(255,255,255,0.16); border: 0; border-radius: 10px;
+    padding: 10px 16px; margin-right: 8px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="slide" id="a"></div>
+  <div class="slide" id="b"></div>
+  <div id="message">Loading photos…</div>
+</div>
+<div id="info">
+  <div class="name" id="info-name"></div>
+  <div class="meta" id="info-meta"></div>
+  <div class="buttons">
+    <button id="btn-next" type="button">Next photo</button>
+    <button id="btn-sync" type="button">Sync now</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  // Written in old-style JavaScript on purpose so it runs on old iPads.
+  var CONFIG = {
+    secondsPerPhoto: 12,   // add ?seconds=20 to the link to override
+    syncMinutes: 3,        // add ?sync=5 to the link to override
+    reloadHours: 12        // full reload now and then keeps old Safari healthy
+  };
+
+  function param(name) {
+    var m = new RegExp('[?&]' + name + '=([^&#]*)').exec(window.location.search);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  var secondsPerPhoto = parseFloat(param('seconds')) || CONFIG.secondsPerPhoto;
+  var syncMinutes = parseFloat(param('sync')) || CONFIG.syncMinutes;
+
+  var photos = {};        // id -> { id, name, url }
+  var order = [];
+  var pos = -1;
+  var currentId = null;
+  var lastSync = null;
+  var dupCount = 0;
+  var failStreak = 0;
+  var timer = null;
+  var infoTimer = null;
+
+  var slides = [document.getElementById('a'), document.getElementById('b')];
+  var front = 0;
+  var messageEl = document.getElementById('message');
+  var infoEl = document.getElementById('info');
+
+  function keys(obj) {
+    var out = [];
+    for (var k in obj) if (obj.hasOwnProperty(k)) out.push(k);
+    return out;
+  }
+
+  function shuffle(arr) {
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+
+  function showMessage(text) {
+    messageEl.innerHTML = text;
+    messageEl.style.display = text ? 'block' : 'none';
+  }
+
+  function imageSize() {
+    var px = Math.max(screen.width, screen.height) * (window.devicePixelRatio || 1);
+    return Math.min(2048, Math.round(px));
+  }
+
+  // ---------- talk to the Worker ----------
+  function fetchList(done) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'api/photos?t=' + new Date().getTime(), true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      if (xhr.status !== 200 || !data || !data.photos) {
+        var why = (data && data.error) ||
+                  (xhr.status === 0 ? 'No internet connection.' : 'The server returned status ' + xhr.status + '.');
+        done(why, null);
+        return;
+      }
+      done(null, data);
+    };
+    xhr.send();
+  }
+
+  function sync() {
+    fetchList(function (err, data) {
+      if (err) {
+        if (!keys(photos).length) showMessage('Couldn\u2019t load the photos.<br>' + err + '<br>Retrying in a minute.');
+        setTimeout(sync, 60000);
+        return;
+      }
+
+      var size = imageSize();
+      var next = {};
+      for (var i = 0; i < data.photos.length; i++) {
+        var p = data.photos[i];
+        next[p.id] = { id: p.id, name: p.name, url: 'photo/' + encodeURIComponent(p.id) + '?s=' + size };
+      }
+
+      var previous = photos;
+      photos = next;
+      dupCount = data.duplicates || 0;
+      lastSync = new Date();
+
+      // Keep the upcoming queue, drop deleted photos, slot new ones in at random spots.
+      var upcoming = [];
+      for (var j = pos + 1; j < order.length; j++) {
+        if (photos[order[j]]) upcoming.push(order[j]);
+      }
+      var ids = keys(photos);
+      for (var k = 0; k < ids.length; k++) {
+        if (!previous[ids[k]]) {
+          upcoming.splice(Math.floor(Math.random() * (upcoming.length + 1)), 0, ids[k]);
+        }
+      }
+      order = upcoming;
+      pos = -1;
+
+      if (!ids.length) {
+        showMessage('The folder is empty.<br>Add photos to it and they\u2019ll show up here.');
+        return;
+      }
+
+      // Nothing on screen yet, or the photo on screen was just removed: move on now.
+      if (!currentId || !photos[currentId]) showNext();
+      updateInfo();
+    });
+  }
+
+  // ---------- slideshow ----------
+  function nextId() {
+    if (!keys(photos).length) return null;
+    while (true) {
+      pos++;
+      if (pos >= order.length) {
+        order = shuffle(keys(photos));
+        if (order.length > 1 && order[0] === currentId) {
+          var t = order[0]; order[0] = order[order.length - 1]; order[order.length - 1] = t;
+        }
+        pos = 0;
+      }
+      if (photos[order[pos]]) return order[pos];
+    }
+  }
+
+  function showNext() {
+    clearTimeout(timer);
+    var id = nextId();
+    if (!id) return;
+    var photo = photos[id];
+
+    var img = new Image();
+    img.onload = function () {
+      failStreak = 0;
+      showMessage('');
+
+      var back = 1 - front;
+      var old = slides[front];
+      slides[back].style.backgroundImage = 'url("' + photo.url + '")';
+      slides[back].className = 'slide on';
+      old.className = 'slide';
+      front = back;
+      currentId = id;
+
+      setTimeout(function () {
+        if (old !== slides[front]) old.style.backgroundImage = 'none';
+      }, 1700);
+
+      updateInfo();
+      timer = setTimeout(showNext, secondsPerPhoto * 1000);
+    };
+    img.onerror = function () {
+      failStreak++;
+      if (failStreak > keys(photos).length) {
+        showMessage('Photos were found but won\u2019t load.<br>Retrying in a minute.');
+        failStreak = 0;
+        timer = setTimeout(showNext, 60000);
+      } else {
+        timer = setTimeout(showNext, 300);
+      }
+    };
+    img.src = photo.url;
+  }
+
+  // ---------- tap for info ----------
+  function minutesAgo(d) {
+    if (!d) return 'never';
+    var m = Math.round((new Date() - d) / 60000);
+    return m < 1 ? 'just now' : m === 1 ? '1 minute ago' : m + ' minutes ago';
+  }
+
+  function updateInfo() {
+    var p = currentId && photos[currentId];
+    document.getElementById('info-name').textContent = p ? p.name : '';
+    var count = keys(photos).length;
+    var text = count + (count === 1 ? ' photo' : ' photos');
+    if (dupCount) text += ', ' + dupCount + (dupCount === 1 ? ' duplicate' : ' duplicates') + ' skipped';
+    text += '. Synced ' + minutesAgo(lastSync) + '.';
+    document.getElementById('info-meta').textContent = text;
+  }
+
+  function toggleInfo(force) {
+    var show = typeof force === 'boolean' ? force : infoEl.className !== 'show';
+    clearTimeout(infoTimer);
+    if (show) {
+      updateInfo();
+      infoEl.className = 'show';
+      infoTimer = setTimeout(function () { infoEl.className = ''; }, 8000);
+    } else {
+      infoEl.className = '';
+    }
+  }
+
+  document.getElementById('stage').addEventListener('click', function () { toggleInfo(); });
+  document.getElementById('btn-next').addEventListener('click', function (e) {
+    e.stopPropagation(); showNext(); toggleInfo(true);
+  });
+  document.getElementById('btn-sync').addEventListener('click', function (e) {
+    e.stopPropagation(); sync(); toggleInfo(true);
+  });
+
+  // ---------- start ----------
+  sync();
+  setInterval(sync, syncMinutes * 60000);
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) sync();
+  });
+
+  setTimeout(function () {
+    if (navigator.onLine !== false) window.location.reload();
+  }, CONFIG.reloadHours * 3600000);
+})();
+</script>
+</body>
+</html>

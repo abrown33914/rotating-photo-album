@@ -1,5 +1,8 @@
 {
   "name": "photo-frame",
   "main": "src/index.js",
-  "compatibility_date": "2026-09-01"
+  "compatibility_date": "2026-09-01",
+  "vars": {
+    "FOLDER_ID": "1fNumpnUnqh_RmwhKOpLNB3y7CU5Tg_Sj"
+  }
 }
